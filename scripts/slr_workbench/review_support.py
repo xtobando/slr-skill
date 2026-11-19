@@ -11,7 +11,9 @@ import hashlib
 import html
 import json
 import re
+import shutil
 import sqlite3
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -22,15 +24,23 @@ from .models import Draft
 from .service import ReviewService
 
 
-def _command(*arguments: str) -> dict[str, str]:
+_SLR_SCRIPT = Path(__file__).resolve().parents[1] / "slr.py"
+
+
+def _command(project: Path, *arguments: str) -> dict[str, str]:
     """Always quote arguments for each shell; never interpolate research text."""
-    if any(any(ord(char) < 32 or ord(char) == 127 for char in part) for part in arguments):
+    use_uv = shutil.which("uv") is not None
+    parts = (str(_SLR_SCRIPT), "--project", str(project), *arguments)
+    if not use_uv:
+        parts = (sys.executable, *parts)
+    if any(any(ord(char) < 32 or ord(char) == 127 for char in part) for part in parts):
         raise ValueError("Command arguments must not contain control characters")
-    quoted_posix = ["'" + part.replace("'", "'\"'\"'") + "'" for part in arguments]
-    quoted_windows = ["'" + part.replace("'", "''") + "'" for part in arguments]
+    quoted_posix = ["'" + part.replace("'", "'\"'\"'") + "'" for part in parts]
+    quoted_windows = ["'" + part.replace("'", "''") + "'" for part in parts]
+    uv_prefix = "uv run --locked --python 3.11 --script "
     return {
-        "macos_linux": "python -m slr_workbench " + " ".join(quoted_posix),
-        "windows_powershell": "python -m slr_workbench " + " ".join(quoted_windows),
+        "macos_linux": (uv_prefix if use_uv else "") + " ".join(quoted_posix),
+        "windows_powershell": (uv_prefix if use_uv else "& ") + " ".join(quoted_windows),
     }
 
 
@@ -173,6 +183,7 @@ def inspect_queue(
     if not current.config.database.exists():
         result["blockers"].append("Review database is absent; run init before scientific work.")
         return result
+    project = current.config.root.resolve()
     connection = sqlite3.connect(current.config.database.resolve().as_uri() + "?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     try:
@@ -332,14 +343,17 @@ def inspect_queue(
                     if entity_type == "report" and doc["report_id"] == entity_id
                 ],
                 "blockers": blockers,
-                "packet_command": None if historical else _command("packet", stage_id, entity_id),
+                "packet_command": None
+                if historical
+                else _command(project, "packet", stage_id, entity_id),
                 "human_review_command": None,
             }
             if not historical and reviewer and not blockers:
                 command = ["review", proposal["id"], "--reviewer", reviewer]
                 if blind:
-                    command.extend(("--decision-file", f"data/drafts/human-{proposal['id']}.json"))
-                row["human_review_command"] = _command(*command)
+                    decision_file = project / "data" / "drafts" / f"human-{proposal['id']}.json"
+                    command.extend(("--decision-file", str(decision_file)))
+                row["human_review_command"] = _command(project, *command)
             if blind:
                 row["status"] = (
                     "independent_assessment_required" if not historical else "historical"
